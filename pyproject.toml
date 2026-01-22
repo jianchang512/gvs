@@ -1,0 +1,12 @@
+[project]
+name = "gvs"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = "==3.10.*"
+dependencies = [
+    "pillow>=12.1.0",
+    "pyinstaller>=6.18.0",
+    "pyside6>=6.10.1",
+    "requests>=2.32.5",
+]
