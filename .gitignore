@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 wheels/
+output/
 *.egg-info
 *.spec
 *.bat
