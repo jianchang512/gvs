@@ -11,9 +11,9 @@ from datetime import datetime, timedelta
 import requests
 from PIL import Image
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                               QHBoxLayout, QLabel, QComboBox, QLineEdit, 
-                               QPushButton, QTextEdit, QFileDialog, QMessageBox, QProgressBar)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QHBoxLayout, QLabel, QComboBox, QLineEdit,
+                               QPushButton, QTextEdit, QFileDialog, QMessageBox, QProgressBar, QSlider)
 from PySide6.QtCore import Qt, QThread, Signal, QLocale, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QCloseEvent, QDesktopServices,QIcon
 
@@ -97,8 +97,10 @@ TRANS = {
         "stop_confirm_msg": "任务正在运行，确定要强制退出吗？",
         "stopping": "正在停止...",
         "force_stop": "正在强制终止线程...",
-        "regions": ["全画面", "底部", "中部", "顶部"],
-        "providers": ["智谱AI", "Gemini"]
+        "regions": ["全画面", "底部", "中部", "顶部", "自定义"],
+        "custom_region_start": "起始:",
+        "custom_region_end": "结束:",
+        "providers": ["智谱AI", "Gemini", "OpenAI(自定义)", "Gemini(自定义)", "Claude(自定义)"]
     },
     "en": {
         "No subtitles were generated":"No subtitles were generated. Please check the error log",
@@ -110,6 +112,10 @@ TRANS = {
         "key_placeholder": "Enter API Key (Plain Text)",
         "zhipu_key_ph": "Enter Zhipu API Key",
         "gemini_key_ph": "Enter Google API Key",
+        "openai_custom_key_ph": "Enter API Key",
+        "gemini_custom_key_ph": "Enter API Key",
+        "claude_custom_key_ph": "Enter API Key",
+        "custom_url_ph": "Enter API URL",
         "start_btn": "Start",
         "stop_btn": "Stop",
         "open_dir_btn": "Open Output Dir",
@@ -136,8 +142,10 @@ TRANS = {
         "stop_confirm_msg": "Task is running. Force quit?",
         "stopping": "Stopping...",
         "force_stop": "Forcing thread termination...",
-        "regions": ["Full Screen", "Bottom", "Middle", "Top"],
-        "providers": ["Zhipu AI", "Gemini"]
+        "regions": ["Full Screen", "Bottom", "Middle", "Top", "Custom"],
+        "custom_region_start": "Start:",
+        "custom_region_end": "End:",
+        "providers": ["Zhipu AI", "Gemini", "OpenAI(Custom)", "Gemini(Custom)", "Claude(Custom)"]
     }
 }
 
@@ -192,19 +200,21 @@ def extract_frame_ffmpeg(video_path, time_sec):
     except:
         return None
 
-def crop_image_bytes(img_bytes, region_idx):
+def crop_image_bytes(img_bytes, region_idx, custom_start=0, custom_end=100):
     """
     根据索引裁切图片
-    region_idx: 0=全画面, 1=底部, 2=中部, 3=顶部
+    region_idx: 0=全画面, 1=底部, 2=中部, 3=顶部, 4=自定义
+    custom_start: 自定义起始百分比 (0-100)
+    custom_end: 自定义结束百分比 (0-100)
     """
     if not img_bytes: return None
     try:
         img = Image.open(io.BytesIO(img_bytes))
         w, h = img.size
-        
+
         # 默认全画面
         y_start, y_end = 0, h
-            
+
         if region_idx == 1: # 底部 (取下 1/3)
             y_start = int(h * 0.66)
         elif region_idx == 3: # 顶部 (取上 1/3)
@@ -212,8 +222,11 @@ def crop_image_bytes(img_bytes, region_idx):
         elif region_idx == 2: # 中部 (取中间 1/3)
             y_start = int(h * 0.33)
             y_end = int(h * 0.66)
+        elif region_idx == 4: # 自定义区域
+            y_start = int(h * custom_start / 100)
+            y_end = int(h * custom_end / 100)
         # region_idx == 0: 全画面，不做改变
-        
+
         crop_box = (0, y_start, w, y_end)
         cropped_img = img.crop(crop_box)
         
@@ -242,15 +255,16 @@ def get_video_duration_ffmpeg(video_path):
 
 
 class AIClient:
-    def __init__(self, provider_idx, api_key, model, log_signal):
-        self.provider_idx = provider_idx # 0=智谱, 1=Gemini
+    def __init__(self, provider_idx, api_key, model, log_signal, api_url=None):
+        self.provider_idx = provider_idx # 0=智谱, 1=Gemini, 2=OpenAI(自定义), 3=Gemini(自定义), 4=Claude(自定义)
         self.api_key = api_key
         self.model = model
         self.log_signal = log_signal
+        self.api_url = api_url  # 自定义API地址
 
     def chat_smart_batch(self, images_base64, start_sec):
         count = len(images_base64)
-        
+
         prompt_text = (
             f"I provide {count} chronological video frames.\n"
             f"The first image corresponds to timestamp {start_sec} seconds.\n"
@@ -264,18 +278,24 @@ class AIClient:
             "6. Output ONLY the JSON string."
         )
 
-        for i in range(3): 
+        for i in range(3):
             try:
                 resp_text = ""
                 if self.provider_idx == 0: # 智谱
                     resp_text = self._call_zhipu(prompt_text, images_base64)
                 elif self.provider_idx == 1: # Gemini
                     resp_text = self._call_gemini_rest(prompt_text, images_base64)
-                
+                elif self.provider_idx == 2: # OpenAI(自定义)
+                    resp_text = self._call_openai_custom(prompt_text, images_base64)
+                elif self.provider_idx == 3: # Gemini(自定义)
+                    resp_text = self._call_gemini_custom(prompt_text, images_base64)
+                elif self.provider_idx == 4: # Claude(自定义)
+                    resp_text = self._call_claude_custom(prompt_text, images_base64)
+
                 log_debug(f"Batch {start_sec}s - Response:\n{resp_text}")
-                
+
                 clean_json = resp_text.replace("```json", "").replace("```", "").strip()
-                
+
                 try:
                     data = json.loads(clean_json)
                 except json.JSONDecodeError:
@@ -284,7 +304,7 @@ class AIClient:
                     except Exception as e:
                         log_debug(f"JSON Parse Error: {e}\nRaw content: {clean_json}")
                         return []
-                
+
                 if isinstance(data, list):
                     return data
                 else:
@@ -293,7 +313,7 @@ class AIClient:
             except Exception as e:
                 err_str = str(e)
                 log_debug(f"API Error: {err_str}")
-                
+
                 self.log_signal.emit(tr("api_fail").format(i+1, err_str))
 
                 if "429" in err_str or "quota" in err_str or "exhausted" in err_str:
@@ -311,16 +331,16 @@ class AIClient:
         for img in images_base64:
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
         data = {"model": self.model, "messages": [{"role": "user", "content": content}], "temperature": 0.05}
-        
+
         resp = requests.post(url, json=data, headers=headers, timeout=60,verify=False)
-        
+
         if resp.status_code != 200:
             try:
                 err_msg = resp.json()["error"]["message"]
             except:
                 err_msg = resp.text
             raise Exception(f"HTTP {resp.status_code}: {err_msg}")
-            
+
         return resp.json()["choices"][0]["message"]["content"].strip()
 
     def _call_gemini_rest(self, prompt, images_base64):
@@ -329,21 +349,21 @@ class AIClient:
         parts = [{"text": prompt}]
         for img in images_base64:
             parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img}})
-        
+
         data = {
-            "contents": [{"parts": parts}], 
+            "contents": [{"parts": parts}],
             "generationConfig": {"temperature": 0.05}
         }
-        
+
         resp = requests.post(url, json=data, headers=headers, timeout=60,verify=False)
-        
+
         if resp.status_code != 200:
             try:
                 err_msg = resp.json()["error"]["message"]
             except:
                 err_msg = resp.text
             raise Exception(f"Gemini Error {resp.status_code}: {err_msg}")
-            
+
         try:
             return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         except:
@@ -353,19 +373,116 @@ class AIClient:
             except:
                 raise Exception(f"Invalid Structure: {resp.text[:100]}...")
 
+    def _call_openai_custom(self, prompt, images_base64):
+        """OpenAI(自定义) - 使用自定义API地址"""
+        if not self.api_url:
+            raise Exception("API URL is not set")
+        url = self.api_url.rstrip('/') + "/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        content = [{"type": "text", "text": prompt}]
+        for img in images_base64:
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
+        data = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.05
+        }
+
+        resp = requests.post(url, json=data, headers=headers, timeout=60, verify=False)
+
+        if resp.status_code != 200:
+            try:
+                err_msg = resp.json()["error"]["message"]
+            except:
+                err_msg = resp.text
+            raise Exception(f"HTTP {resp.status_code}: {err_msg}")
+
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+    def _call_gemini_custom(self, prompt, images_base64):
+        """Gemini(自定义) - 使用自定义API地址"""
+        if not self.api_url:
+            raise Exception("API URL is not set")
+        # 自定义URL + /v1beta/models/{model}:generateContent
+        url = self.api_url.rstrip('/') + f"/v1beta/models/{self.model}:generateContent"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        parts = [{"text": prompt}]
+        for img in images_base64:
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img}})
+
+        data = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {"temperature": 0.05}
+        }
+
+        resp = requests.post(url, json=data, headers=headers, timeout=60, verify=False)
+
+        if resp.status_code != 200:
+            try:
+                err_msg = resp.json()["error"]["message"]
+            except:
+                err_msg = resp.text
+            raise Exception(f"HTTP {resp.status_code}: {err_msg}")
+
+        try:
+            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except:
+            raise Exception(f"Invalid Response Structure: {resp.text[:100]}...")
+
+    def _call_claude_custom(self, prompt, images_base64):
+        """Claude(自定义) - 使用自定义API地址"""
+        if not self.api_url:
+            raise Exception("API URL is not set")
+        # Claude 使用 /v1/messages
+        url = self.api_url.rstrip('/') + "/v1/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01"
+        }
+        # Claude 格式需要把图片转成 base64 放入 messages
+        content_parts = [{"type": "text", "text": prompt}]
+        for img in images_base64:
+            content_parts.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}})
+
+        data = {
+            "model": self.model,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": content_parts}]
+        }
+
+        resp = requests.post(url, json=data, headers=headers, timeout=60, verify=False)
+
+        if resp.status_code != 200:
+            try:
+                err_msg = resp.json()["error"]["message"]
+            except:
+                err_msg = resp.text
+            raise Exception(f"HTTP {resp.status_code}: {err_msg}")
+
+        return resp.json()["content"][0]["text"].strip()
+
 
 class Processor(QThread):
     log = Signal(str)
     progress = Signal(int, int)
     finished = Signal()
-    
-    def __init__(self, video_path, region_idx, api_key, model, provider_idx):
+
+    def __init__(self, video_path, region_idx, api_key, model, provider_idx, api_url=None, custom_region=(0, 100)):
         super().__init__()
         self.video_path = video_path
         self.region_idx = region_idx # int
         self.api_key = api_key
         self.model = model
         self.provider_idx = provider_idx # int
+        self.api_url = api_url  # 自定义API地址
+        self.custom_start, self.custom_end = custom_region  # 自定义裁切区域百分比
         self.running = True
         self.BATCH_SIZE = 20
 
@@ -373,7 +490,7 @@ class Processor(QThread):
         provider_name = tr("providers")[self.provider_idx]
         self.log.emit(tr("task_start").format(os.path.basename(self.video_path)))
         self.log.emit(tr("service_info").format(provider_name, self.model))
-        
+
         duration = get_video_duration_ffmpeg(self.video_path)
         if duration == 0:
             self.log.emit(tr("ffmpeg_error"))
@@ -383,7 +500,7 @@ class Processor(QThread):
         self.log.emit(tr("video_info").format(total_seconds, self.BATCH_SIZE))
 
         try:
-            client = AIClient(self.provider_idx, self.api_key, self.model, self.log)
+            client = AIClient(self.provider_idx, self.api_key, self.model, self.log, self.api_url)
             final_subtitles = []
             
             batch_imgs = []
@@ -399,7 +516,7 @@ class Processor(QThread):
                     
                 img_bytes = extract_frame_ffmpeg(self.video_path, sec)
                 if img_bytes:
-                    b64 = crop_image_bytes(img_bytes, self.region_idx)
+                    b64 = crop_image_bytes(img_bytes, self.region_idx, self.custom_start, self.custom_end)
                     if b64:
                         batch_imgs.append(b64)
                 
@@ -501,7 +618,9 @@ class MainWindow(QMainWindow):
 
         
         # 内存中缓存 Key
-        self.api_keys = ["", ""] # 0=Zhipu, 1=Gemini
+        # 0=Zhipu, 1=Gemini, 2=OpenAI(自定义), 3=Gemini(自定义), 4=Claude(自定义)
+        self.api_keys = ["", "", "", "", ""]
+        self.custom_api_urls = ["", "", ""]  # 2,3,4 对应的URL
         
         self.apply_stylesheet()
         self.setup_ui()
@@ -538,7 +657,30 @@ class MainWindow(QMainWindow):
         row1 = QHBoxLayout()
         self.region_combo = QComboBox()
         self.region_combo.addItems(tr("regions"))
-        
+        # 连接区域选择变化信号
+        self.region_combo.currentIndexChanged.connect(self.on_region_changed)
+
+        # 自定义裁切滑块
+        self.custom_start_slider = QSlider(Qt.Horizontal)
+        self.custom_start_slider.setRange(0, 100)
+        self.custom_start_slider.setValue(0)
+        self.custom_start_slider.setFixedWidth(80)
+        self.custom_start_slider.setVisible(False)
+        self.custom_start_slider.valueChanged.connect(self.on_custom_region_changed)
+
+        self.custom_end_slider = QSlider(Qt.Horizontal)
+        self.custom_end_slider.setRange(0, 100)
+        self.custom_end_slider.setValue(100)
+        self.custom_end_slider.setFixedWidth(80)
+        self.custom_end_slider.setVisible(False)
+        self.custom_end_slider.valueChanged.connect(self.on_custom_region_changed)
+
+        # 自定义裁切百分比显示标签
+        self.custom_start_label = QLabel("0%")
+        self.custom_start_label.setVisible(False)
+        self.custom_end_label = QLabel("100%")
+        self.custom_end_label.setVisible(False)
+
         self.provider_combo = QComboBox()
         self.provider_combo.addItems(tr("providers"))
         # 使用 currentIndexChanged (int) 触发
@@ -548,17 +690,32 @@ class MainWindow(QMainWindow):
         self.key_edit.setPlaceholderText(tr("key_placeholder"))
         self.key_edit.setEchoMode(QLineEdit.Normal)
         self.key_edit.textChanged.connect(self.on_key_edited)
-        
-        self.model_combo = QComboBox()
-        self.model_combo.setFixedWidth(180)
-        
+
+        self.model_edit = QLineEdit()
+        self.model_edit.setPlaceholderText("gpt-4o-mini")
+        self.model_edit.setFixedWidth(180)
+
+        self.api_url_edit = QLineEdit()
+        self.api_url_edit.setPlaceholderText(tr("custom_url_ph"))
+        self.api_url_edit.setFixedWidth(250)
+        self.api_url_edit.setVisible(False)
+
         row1.addWidget(QLabel(tr("region")))
         row1.addWidget(self.region_combo)
+        # 自定义裁切区域控件
+        row1.addWidget(QLabel(tr("custom_region_start")))
+        row1.addWidget(self.custom_start_slider)
+        row1.addWidget(self.custom_start_label)
+        row1.addWidget(QLabel(tr("custom_region_end")))
+        row1.addWidget(self.custom_end_slider)
+        row1.addWidget(self.custom_end_label)
+        row1.addSpacing(10)  # 分隔
         row1.addWidget(QLabel(tr("provider")))
         row1.addWidget(self.provider_combo)
         row1.addWidget(self.key_edit)
         row1.addWidget(QLabel(tr("model")))
-        row1.addWidget(self.model_combo)
+        row1.addWidget(self.model_edit)
+        row1.addWidget(self.api_url_edit)
         layout.addLayout(row1)
         
         row2 = QHBoxLayout()
@@ -592,15 +749,63 @@ class MainWindow(QMainWindow):
 
     def on_provider_changed(self, idx):
         """切换服务商 (int idx)"""
-        self.model_combo.clear()
+        # 显示/隐藏 API URL 输入框
+        show_url = idx >= 2  # 自定义服务需要URL
+        self.api_url_edit.setVisible(show_url)
+
         if idx == 0: # 智谱
-            self.model_combo.addItems(["glm-4.6v-flash","glm-4v-flash"])
             self.key_edit.setPlaceholderText(tr("zhipu_key_ph"))
+            self.model_edit.setPlaceholderText("glm-4-vision-flash")
+            self.api_url_edit.setPlaceholderText("")
+            self.api_url_edit.setText("")
         elif idx == 1: # Gemini
-            self.model_combo.addItems(["gemini-2.5-flash", "gemini-3-flash-preview","gemini-2.0-flash","gemini-flash-latest","gemini-3-pro-preview","gemini-2.5-pro"])
             self.key_edit.setPlaceholderText(tr("gemini_key_ph"))
-            
+            self.model_edit.setPlaceholderText("gemini-2.0-flash-exp")
+            self.api_url_edit.setPlaceholderText("")
+            self.api_url_edit.setText("")
+        elif idx == 2: # OpenAI(自定义)
+            self.key_edit.setPlaceholderText(tr("openai_custom_key_ph"))
+            self.model_edit.setPlaceholderText("gpt-4o")
+            self.api_url_edit.setPlaceholderText(tr("custom_url_ph"))
+            self.api_url_edit.setText(self.custom_api_urls[0])
+        elif idx == 3: # Gemini(自定义)
+            self.key_edit.setPlaceholderText(tr("gemini_custom_key_ph"))
+            self.model_edit.setPlaceholderText("gemini-2.0-flash")
+            self.api_url_edit.setPlaceholderText(tr("custom_url_ph"))
+            self.api_url_edit.setText(self.custom_api_urls[1])
+        elif idx == 4: # Claude(自定义)
+            self.key_edit.setPlaceholderText(tr("claude_custom_key_ph"))
+            self.model_edit.setPlaceholderText("claude-sonnet-4-20250514")
+            self.api_url_edit.setPlaceholderText(tr("custom_url_ph"))
+            self.api_url_edit.setText(self.custom_api_urls[2])
+
         self.key_edit.setText(self.api_keys[idx])
+
+    def on_region_changed(self, idx):
+        """切换区域选择"""
+        # idx=4 是自定义区域，显示滑块
+        show_custom = (idx == 4)
+        self.custom_start_slider.setVisible(show_custom)
+        self.custom_end_slider.setVisible(show_custom)
+        self.custom_start_label.setVisible(show_custom)
+        self.custom_end_label.setVisible(show_custom)
+
+    def on_custom_region_changed(self):
+        """自定义裁切滑块变化"""
+        start = self.custom_start_slider.value()
+        end = self.custom_end_slider.value()
+
+        # 确保起始位置不超过结束位置
+        if start > end:
+            if self.sender() == self.custom_start_slider:
+                self.custom_end_slider.setValue(start)
+                end = start
+            else:
+                self.custom_start_slider.setValue(end)
+                start = end
+
+        self.custom_start_label.setText(f"{start}%")
+        self.custom_end_label.setText(f"{end}%")
 
     def on_key_edited(self, text):
         idx = self.provider_combo.currentIndex()
@@ -613,21 +818,35 @@ class MainWindow(QMainWindow):
 
     def load_settings(self):
         cfg = load_config()
-        
+
         # 加载 keys
         self.api_keys[0] = cfg.get("zhipu_key", "")
         self.api_keys[1] = cfg.get("gemini_key", "")
-        
+        self.api_keys[2] = cfg.get("openai_custom_key", "")
+        self.api_keys[3] = cfg.get("gemini_custom_key", "")
+        self.api_keys[4] = cfg.get("claude_custom_key", "")
+
+        # 加载自定义URL
+        self.custom_api_urls[0] = cfg.get("openai_custom_url", "")
+        self.custom_api_urls[1] = cfg.get("gemini_custom_url", "")
+        self.custom_api_urls[2] = cfg.get("claude_custom_url", "")
+
+        # 加载自定义裁切区域
+        self.custom_start_slider.setValue(int(cfg.get("custom_region_start", 0)))
+        self.custom_end_slider.setValue(int(cfg.get("custom_region_end", 100)))
+
         # 恢复索引 (int)
         self.region_combo.setCurrentIndex(int(cfg.get("region_idx", 1))) # 默认底部(1)
-        
+
         last_provider_idx = int(cfg.get("provider_idx", 0)) # 默认智谱(0)
         self.provider_combo.setCurrentIndex(last_provider_idx)
-        
+
         # 手动刷新一次确保状态同步
         self.on_provider_changed(last_provider_idx)
-        
-        self.model_combo.setCurrentText(cfg.get("model", ""))
+        self.on_region_changed(self.region_combo.currentIndex())
+        self.on_custom_region_changed()  # 更新标签显示
+
+        self.model_edit.setText(cfg.get("model", ""))
 
     def dragEnterEvent(self, e: QDragEnterEvent):
         if e.mimeData().hasUrls(): e.accept()
@@ -654,27 +873,54 @@ class MainWindow(QMainWindow):
 
     def start(self):
         if not hasattr(self, 'video_path'): return QMessageBox.warning(self, tr("msg_hint"), tr("msg_no_video"))
-        
+
         p_idx = self.provider_combo.currentIndex()
         p_name = self.provider_combo.currentText()
         key = self.api_keys[p_idx]
-        
+        model = self.model_edit.text().strip()
+        api_url = None
+
+        # 自定义服务需要获取API URL
+        if p_idx >= 2:
+            api_url = self.api_url_edit.text().strip()
+            # 保存到对应索引
+            url_idx = p_idx - 2
+            if url_idx == 0:
+                self.custom_api_urls[0] = api_url
+            elif url_idx == 1:
+                self.custom_api_urls[1] = api_url
+            elif url_idx == 2:
+                self.custom_api_urls[2] = api_url
+
         if not key: return QMessageBox.warning(self, tr("msg_hint"), tr("msg_no_key").format(p_name))
-        
+        if not model: return QMessageBox.warning(self, tr("msg_hint"), tr("msg_no_key").format("Model"))
+        if p_idx >= 2 and not api_url: return QMessageBox.warning(self, tr("msg_hint"), "请输入 API URL")
+
         # 保存配置 (使用索引)
         save_config({
             "region_idx": self.region_combo.currentIndex(),
             "provider_idx": p_idx,
-            "model": self.model_combo.currentText(),
+            "model": model,
             "zhipu_key": self.api_keys[0],
-            "gemini_key": self.api_keys[1]
+            "gemini_key": self.api_keys[1],
+            "openai_custom_key": self.api_keys[2],
+            "gemini_custom_key": self.api_keys[3],
+            "claude_custom_key": self.api_keys[4],
+            "openai_custom_url": self.custom_api_urls[0],
+            "gemini_custom_url": self.custom_api_urls[1],
+            "claude_custom_url": self.custom_api_urls[2],
+            "custom_region_start": self.custom_start_slider.value(),
+            "custom_region_end": self.custom_end_slider.value()
         })
-        
+
         self.btn_start.setEnabled(False); self.btn_stop.setEnabled(True)
         self.log_box.clear(); self.pbar.setValue(0)
-        
+
+        # 获取自定义裁切区域
+        custom_region = (self.custom_start_slider.value(), self.custom_end_slider.value())
+
         # 传入 region_idx 和 provider_idx (均为 int)
-        self.worker = Processor(self.video_path, self.region_combo.currentIndex(), key, self.model_combo.currentText(), p_idx)
+        self.worker = Processor(self.video_path, self.region_combo.currentIndex(), key, model, p_idx, api_url, custom_region)
         self.worker.log.connect(self.log)
         self.worker.progress.connect(lambda c, t: (self.pbar.setMaximum(t), self.pbar.setValue(c)))
         self.worker.finished.connect(self.on_finished)
